@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -115,6 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
+MAX_EARLY_CHECKPOINTS = 1  # mid-loop forced commitment when half the step budget is spent and we still have no patch
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
 # real history. The validator clones the real repo with full git history; the
@@ -744,6 +746,11 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
 
     terms = _issue_terms(issue)
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
+    # Files touched in the last ~30 commits — strong signal of "active work
+    # area" that bug-fix tasks usually target. No-op on staged-snapshot repos
+    # (single synthetic commit) so this only activates on the live validator
+    # clone with real history.
+    recent = _recently_modified_files(repo, n_commits=30)
     scored: List[Tuple[int, str]] = []
     for relative_path in tracked:
         if not _context_file_allowed(relative_path):
@@ -766,6 +773,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         # Boost files whose contents reference identifiers from the issue.
         if relative_path in symbol_hits:
             score += 60 + min(40, 8 * symbol_hits[relative_path])
+        # Recency boost: a file edited in the last 30 commits is far more
+        # likely to be the right target than a long-quiet file. Sized between
+        # the path-mention boost (100) and stem-match (16) so it nudges
+        # ranking but doesn't override an explicit issue mention.
+        if relative_path in recent:
+            score += 22
         if score > 0:
             scored.append((score, relative_path))
 
@@ -795,6 +808,50 @@ def _tracked_files(repo: Path) -> List[str]:
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _recently_modified_files(repo: Path, n_commits: int = 30) -> set:
+    """Return file paths touched in the last N commits.
+
+    Real GitHub repos have substantial history; bug fixes typically land in
+    files that were recently active. Boosting these in _rank_context_files
+    catches the "wrong target" failure mode (round 11 of duel #4062 — agent
+    edited AdminUserController instead of the correct controller because the
+    issue text didn't name a path explicitly).
+
+    Returns empty set on staged-snapshot repos with only one synthetic commit
+    (silent no-op locally; lift only when validator clones with real history).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--name-only", "--pretty=format:", "-n", str(n_commits)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return set()
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _patch_is_effectively_empty(patch_text: str) -> bool:
+    """True if patch is literally empty OR only mode-bit / chmod-style changes.
+
+    Anon-magician (PR #185) added _strip_mode_only_file_diffs to clean up
+    output, but the live duel #4062 still had rounds where the agent's only
+    output was a mode change (e.g. round 32, 36 of duel #4041 - "patches are
+    identical and only change file permissions"). Validator scores those as 0.
+    Treat them as 'no real work' and route to hail-mary instead of accepting
+    them as a final patch.
+    """
+    if not patch_text.strip():
+        return True
+    stripped = _strip_mode_only_file_diffs(patch_text)
+    return not stripped.strip()
 
 
 def _context_file_allowed(relative_path: str) -> bool:
@@ -1126,9 +1183,18 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
         return f"{relative_path}: parse failure: {exc}"
 
 
+# Languages where ' is unambiguously a string delimiter. The brace-balance
+# parser below treats ' as a string-mode toggle, which produces false
+# positives on:
+#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
+#     (so `char c = '}';` flips into string mode and eats until next ')
+#   - Rust — `'a` is a lifetime annotation
+#   - Go — `'X'` is a rune literal
+# Net effect of including those: a single `'X'` in any function would yield
+# a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
+# to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
-    ".cs", ".java", ".kt", ".swift", ".cpp", ".cc", ".c", ".h", ".hpp",
-    ".scala", ".go", ".rs", ".jsx", ".tsx", ".ts",
+    ".ts", ".tsx", ".jsx", ".swift",
 }
 
 
@@ -1237,17 +1303,17 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 
 
 def _has_executable(name: str) -> bool:
-    """Quick shell `command -v` check; cheaper than starting a Python import."""
+    """True if `name` is on PATH. Uses shutil.which (stdlib).
+
+    The earlier impl invoked `command -v` via subprocess with shell=False,
+    but `command` is a bash builtin and not a standalone binary on
+    python:3.11-slim, so the subprocess call always raised FileNotFoundError
+    and returned False. Net effect: every gate that depends on this check
+    (e.g. JS/TS `node --check`, pytest discovery) silently no-op'd in
+    production. shutil.which is the portable equivalent.
+    """
     try:
-        proc = subprocess.run(
-            ["command", "-v", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-            shell=False,
-        )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
+        return shutil.which(name) is not None
     except Exception:
         return False
 
@@ -1328,6 +1394,135 @@ def _augment_with_test_partners(files: List[str], tracked: set) -> List[str]:
     return augmented
 
 
+def _run_companion_test(
+    repo: Path,
+    test_path: str,
+    timeout_seconds: int = 8,
+) -> Optional[str]:
+    """Best-effort companion-test execution. Returns failure-output tail on FAIL,
+    or None when the test passed, the runner is unavailable, or the language
+    isn't supported.
+
+    Languages handled:
+      - Python: `pytest` (if on PATH) then `python3 -m pytest <path>`. We skip
+        the failure when output indicates pytest itself isn't importable
+        (ModuleNotFoundError) — that's not a real test failure.
+      - JS/TS: `node --check <test_path>`. We don't try jest/vitest because
+        they require project-level config we can't synthesize in 8s on an
+        unknown repo.
+      - Other languages: skipped (returns None).
+
+    Errors (timeout, runner missing, exception) intentionally degrade to None
+    so the refinement chain doesn't queue a fix for something the agent can't
+    actually act on. The whole gate is best-effort.
+
+    Pairs with build_test_fix_prompt — when this returns a non-None failure
+    tail, that tail is fed back to the model as one extra refinement turn.
+    Companion-test execution was scaffolded by previous king alexlange1 (the
+    constant MAX_TEST_FIX_TURNS, the helper build_test_fix_prompt, and the
+    co-loading templates _TEST_PARTNER_TEMPLATES) but never wired up; the
+    massive PR #185 rewrite preserved the dead scaffolding without using it.
+    This re-introduces the runtime-correctness signal as a refinement gate.
+    """
+    full = repo / test_path
+    if not full.exists() or not full.is_file():
+        return None
+
+    suffix = Path(test_path).suffix.lower()
+
+    # ---- Python ----
+    if suffix == ".py":
+        runner_cmds: List[List[str]] = []
+        if _has_executable("pytest"):
+            runner_cmds.append(["pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+        # Always also try `python3 -m pytest`: works when pytest is importable
+        # but no `pytest` binary is on PATH (pip-installed without entry script).
+        runner_cmds.append(["python3", "-m", "pytest", "-x", "--tb=short", "-q", "--no-header", test_path])
+
+        for cmd in runner_cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(repo),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_seconds,
+                    env=_command_env(),
+                )
+            except subprocess.TimeoutExpired:
+                return f"Companion test `{test_path}` timed out after {timeout_seconds}s."
+            except Exception:
+                continue
+
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            unrunnable_markers = (
+                "No module named pytest",
+                "No module named 'pytest'",
+                "command not found",
+                "/usr/bin/env: python3",
+            )
+            if any(marker in output for marker in unrunnable_markers):
+                continue  # try next runner / give up if all fail
+            if proc.returncode == 0:
+                return None  # test passed
+            return output[-2400:] if len(output) > 2400 else output
+
+        return None  # no runner produced a usable signal
+
+    # ---- JS / TS ----
+    if suffix in {".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs"}:
+        if not _has_executable("node"):
+            return None
+        try:
+            proc = subprocess.run(
+                ["node", "--check", test_path],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=_command_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"Companion test `{test_path}` parse timed out after {timeout_seconds}s."
+        except Exception:
+            return None
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return output[-2400:] if len(output) > 2400 else output
+
+    return None  # other languages: skip
+
+
+def _select_companion_test_failure(
+    repo: Path,
+    patch: str,
+    test_timeout_seconds: int = 8,
+) -> Optional[Tuple[str, str]]:
+    """For files touched by the patch, find the first companion test that fails.
+
+    Returns (test_path, output_tail) on the first non-None failure, else None.
+    Stops at the first failure to keep the refinement budget tight (one fix
+    turn maximum per cycle).
+    """
+    edited = _patch_changed_files(patch)
+    if not edited:
+        return None
+    tracked = set(_tracked_files(repo))
+    if not tracked:
+        return None
+    for relative_path in edited:
+        partner = _find_test_partner(relative_path, tracked)
+        if not partner:
+            continue
+        output = _run_companion_test(repo, partner, timeout_seconds=test_timeout_seconds)
+        if output:
+            return (partner, output)
+    return None
+
+
 def _recent_commit_examples(repo: Path) -> str:
     """v21 edge: read recent small-diff commits from the staged repo via git log
     and format them as in-context style anchors. Returns empty string when the
@@ -1375,8 +1570,15 @@ def _recent_commit_examples(repo: Path) -> str:
                     break
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
+            # NOTE: previous version passed --pretty=format:%s which caused
+            # `git show` to emit the commit subject in place of the standard
+            # header but git still appended the diff. After the >=100 char
+            # filter the only commits that survived were those with very long
+            # subjects (e.g. squash messages); their wrapped output was a mix
+            # of subject + diff, which is noise. --pretty=format: empties the
+            # header entirely so we keep just the diff body.
             diff_proc = subprocess.run(
-                ["git", "show", "--no-merges", "--pretty=format:%s", sha],
+                ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
@@ -1869,6 +2071,38 @@ def build_hail_mary_prompt(issue_text: str) -> str:
     )
 
 
+def build_early_checkpoint_prompt(issue_text: str, step: int, max_steps: int) -> str:
+    """Mid-loop intervention: half the step budget is gone and no patch yet.
+
+    iter-003 finding (live duel #4062): 7/22 of our losses were "challenger
+    empty patch" — agent ran out of steps or wall-clock time still exploring
+    instead of editing. Plus 2/22 were "timed out with partial work" — same
+    failure mode at a different point in the loop. Anon-magician's hail-mary
+    only runs after the model itself emits <final>; if the model never gets
+    there before the budget is exhausted, the empty patch ships unchallenged.
+
+    This prompt is injected as a user message at step ~max_steps/2 to force
+    a real edit before the back half of the budget. Different from
+    build_hail_mary_prompt (which fires post-final) — this one fires mid-loop
+    while the model is still issuing commands, so it slots into the natural
+    ReAct flow rather than starting a refinement cycle.
+    """
+    short = issue_text[:1200] if len(issue_text) > 1200 else issue_text
+    return (
+        f"BUDGET CHECKPOINT (step {step} of {max_steps}). Half your step budget "
+        "is gone and there is still no patch in this repo. Stop exploring. The "
+        "validator will score you 0 if no edits land before the budget ends, "
+        "regardless of how thorough your reading was.\n\n"
+        f"ISSUE (re-read):\n{short}\n\n"
+        "RIGHT NOW, in this very response, issue ONE bash command that makes a "
+        "real code edit on the most likely target file. Use sed -i / python3 -c "
+        "/ heredoc — whatever is concrete. Do not run any more grep / find / cat / "
+        "ls commands first. Make a plausible edit even if you are uncertain — a "
+        "partially-correct patch beats an empty one on both Cursor similarity and "
+        "LLM judge. After the edit, you can refine in the remaining steps."
+    )
+
+
 def build_test_fix_prompt(test_path: str, output: str) -> str:
     """When the companion-test gate fails, hand the model the exact failure tail."""
     tail = output[-2400:] if len(output) > 2400 else output
@@ -1915,9 +2149,11 @@ def solve(
     polish_turns_used = 0
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
+    test_fix_turns_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
+    early_checkpoints_used = 0
     consecutive_model_errors = 0
     solve_started_at = time.monotonic()
 
@@ -1945,26 +2181,37 @@ def solve(
             0. hail-mary — patch empty after everything: force one real edit
             1. polish — drop low-signal hunks the model still emitted
             2. syntax — quote any parser error back at the model
-            3. coverage-nudge — name issue-mentioned paths still untouched
-            4. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle.
+            3. test — actually run the companion test if one exists; if it
+                      fails, feed the failure tail back via build_test_fix_prompt
+            4. coverage-nudge — name issue-mentioned paths still untouched
+            5. criteria-nudge — name issue acceptance bullets not addressed
+            6. self-check — show the diff and ask "did you cover everything?"
+        Each refinement runs at most once per cycle. Test fires AFTER syntax
+        (we know the patch parses) but BEFORE coverage/criteria/self-check
+        (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used
         patch = get_patch(repo)
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. The original `return False` here silently accepted empty
-        # patches and cost ~10% of rounds in the live duel that promoted
-        # this king. An empty patch has Jaccard = 0 against any non-empty
-        # reference; a guess has Jaccard > 0 with non-zero probability.
-        # Force one final real-edit attempt before the duel scores zero.
-        if not patch.strip():
+        # iter-003: extend the empty-patch trip to also catch "effectively
+        # empty" patches (only file-mode changes). In duel #4041 round 32
+        # and 36 the previous king and challenger both submitted patches
+        # that were ONLY chmod-style mode bit flips and the validator
+        # scored both 0. Without this gate they ride through as accepted
+        # patches; with it they go through the same hail-mary route as
+        # literally-empty patches.
+        if _patch_is_effectively_empty(patch):
             if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
                 hail_mary_turns_used += 1
+                marker = (
+                    "HAIL_MARY_QUEUED: patch empty at refinement gate"
+                    if not patch.strip()
+                    else "HAIL_MARY_QUEUED: patch is mode-only (effectively empty)"
+                )
                 queue_refinement_turn(
                     assistant_text,
                     build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                    marker,
                 )
                 return True
             return False
@@ -1988,6 +2235,27 @@ def solve(
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
+                )
+                return True
+
+        # Companion-test execution gate. The previous king alexlange1 (PR #44)
+        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
+        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
+        # them from solve(). The +1269 line PR #185 rewrite kept the dead
+        # scaffolding without using it. We re-introduce the runtime
+        # correctness signal: if any edited file has a partner test that
+        # actually fails, surface the failure tail to the model as one fix
+        # turn. This is the only refinement step in the chain backed by a
+        # real runner rather than heuristics.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            failure = _select_companion_test_failure(repo, patch)
+            if failure is not None:
+                test_path, output = failure
+                test_fix_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_test_fix_prompt(test_path, output),
+                    f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
 
@@ -2044,6 +2312,18 @@ def solve(
 
         _wall_start = time.monotonic()
 
+        # iter-003 mid-loop checkpoint: when half the step budget is spent
+        # and no patch exists in the repo, inject an explicit "stop exploring,
+        # edit now" prompt before continuing. Anon-magician (PR #185)'s
+        # hail-mary only fires after the model emits <final> — if the model
+        # never reaches <final> before the budget is exhausted, the empty
+        # patch ships. Live duel #4062 had 7/22 losses where we shipped empty
+        # plus 2/22 where we timed out with only partial work; the audit
+        # rationales explicitly mentioned "challenger timed out, scoring 0".
+        # Firing at max_steps//2 (step 15 for default 30) gives the model the
+        # full back-half of the budget to refine an actually-existing patch.
+        midpoint_step = max(8, max_steps // 2)
+
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
 
@@ -2054,6 +2334,22 @@ def solve(
                     "exiting loop early to return whatever patch we have."
                 )
                 break
+
+            # Force a commitment at the midpoint if we still have nothing.
+            if (
+                step == midpoint_step
+                and early_checkpoints_used < MAX_EARLY_CHECKPOINTS
+                and _patch_is_effectively_empty(get_patch(repo))
+            ):
+                early_checkpoints_used += 1
+                messages.append({
+                    "role": "user",
+                    "content": build_early_checkpoint_prompt(issue, step, max_steps),
+                })
+                logs.append(
+                    f"EARLY_CHECKPOINT_QUEUED: midpoint reached at step {step} of "
+                    f"{max_steps}; patch still effectively empty -- forcing a real edit"
+                )
 
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
